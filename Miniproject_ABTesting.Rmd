@@ -1,0 +1,591 @@
+---
+title: "Phân tích A/B Testing - Marketing Campaign"
+author: "Phân tích Bootstrap & Permutation Test"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: cosmo
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, 
+  warning = FALSE, 
+  message = FALSE,
+  fig.width = 8,
+  fig.height = 5
+)
+```
+
+# Giới thiệu
+
+Báo cáo này phân tích hiệu quả của chiến dịch quảng cáo (A/B testing) so sánh hai nhóm:
+
+- **ad**: Người dùng xem quảng cáo
+- **psa**: Người dùng chỉ xem thông báo công ích (Public Service Announcement)
+
+Mục tiêu: Xác định xem việc xem quảng cáo có ảnh hưởng đến tỷ lệ chuyển đổi (conversion rate) hay không.
+
+---
+
+# 1. Data Cleaning & EDA
+
+## 1.1 Đọc và làm sạch dữ liệu
+
+
+```{r load-libraries}
+# Load các thư viện cần thiết
+library(tidyverse)
+library(janitor)
+library(ggplot2)
+library(boot)
+library(infer)
+library(RColorBrewer)
+```
+
+```{r read-data}
+# Đọc dữ liệu và làm sạch tên cột
+data <- read.csv("C:/Users/lenovo/Downloads/marketing_AB.csv", header = TRUE) %>%
+  clean_names()
+
+# Xem cấu trúc dữ liệu
+glimpse(data)
+```
+
+```{r convert-variables}
+# Chuyển đổi biến converted sang dạng numeric (1 = TRUE, 0 = FALSE)
+data <- data |> mutate(
+  test_group = as.factor(test_group),
+  converted = ifelse(converted == "True", 1, 0)
+)
+
+# Hiển thị vài dòng đầu
+head(data)
+```
+
+Các biến có trong dataset: 
+`test_group`: gồm 2 nhóm (`ad`: có xem quảng cáo trên MXH, `psa`: chỉ xem thông báo trên MXH)
+`converted` : có mua hàng hay không (không mua: 0, có mua: 1)
+`total_ads` : tổng số quảng cáo xem được
+`most_ads_day`: xem nhiều nhất ngày nào
+`most_ads_hour`: xem nhiều nhất thời điểm nào
+
+
+## 1.2 Tóm tắt dữ liệu
+
+```{r}
+# Tóm tắt chung
+summary(data)
+
+# Bảng phân phối test_group
+table(data$test_group)
+
+# Bảng phân phối converted
+table(data$converted)
+
+# Bảng chéo
+table(data$test_group, data$converted)
+```
+
+## 1.3 Số lượng quan sát mỗi nhóm
+
+```{r group-counts}
+# Đếm số quan sát trong mỗi nhóm
+group_summary <- data %>%
+  group_by(test_group) %>%
+  summarise(
+    n = n(),
+    n_converted = sum(converted),
+    conversion_rate = mean(converted)
+  )
+
+print(group_summary)
+
+```
+
+
+```{r}
+# Tạo conversion_summary với conversion_pct để vẽ biểu đồ
+conversion_summary <- group_summary %>%
+  mutate(conversion_pct = round(conversion_rate * 100, 2))
+
+# Tính chênh lệch quan sát (obs_diff) để dùng trong nhận xét
+obs_diff <- conversion_summary %>%
+  summarise(diff = conversion_rate[test_group == "ad"] - 
+                   conversion_rate[test_group == "psa"]) %>%
+  pull(diff)
+```
+
+
+## 1.4 Biểu đồ tỷ lệ chuyển đổi
+
+```{r}
+# Vẽ biểu đồ thanh
+pastel_colors <- RColorBrewer::brewer.pal(n = 2, name = "Pastel1")
+names(pastel_colors) <- c("ad", "psa")
+ggplot(conversion_summary, aes(x = test_group, y = conversion_pct, fill = test_group)) +
+  geom_col(width = 0.6, alpha = 1) +
+  geom_text(aes(label = paste0(conversion_pct, "%")), 
+            vjust = -0.5, size = 5, fontface = "bold") +
+  scale_fill_manual(values = pastel_colors) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
+  labs(
+    title = "Tỷ lệ chuyển đổi theo nhóm Test",
+    subtitle = "So sánh giữa nhóm xem quảng cáo (ad) và nhóm công ích (psa)",
+    x = "Nhóm Test",
+    y = "Tỷ lệ chuyển đổi (%)",
+    fill = "Nhóm"
+  ) +
+  theme_minimal(base_size = 15) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", color= "red"),
+    plot.subtitle = element_text(hjust = 0.5, face = "bold", color= "red"),
+    axis.title.x = element_text(color = "red"),
+    axis.title.y = element_text(color = "red"),
+    axis.text.x = element_text(
+      color = c(pastel_colors["ad"], pastel_colors["psa"]), 
+      face = "bold", 
+      size = 14
+    ),
+    legend.position = "none"
+  )
+```
+
+
+**Nhận xét ban đầu:** 
+
+- Nhóm `ad` có tỷ lệ chuyển đổi là `r round(conversion_summary$conversion_pct[conversion_summary$test_group == "ad"], 2)`%
+- Nhóm `psa` có tỷ lệ chuyển đổi là `r round(conversion_summary$conversion_pct[conversion_summary$test_group == "psa"], 2)`%
+- Chênh lệch quan sát: `r round(obs_diff * 100, 2)`%
+
+---
+
+# 2. Bootstrap Test
+
+## 2.1 Phương pháp Bootstrap
+
+Bootstrap là kỹ thuật lấy mẫu lại với thay thế (resampling with replacement) để kiểm định giả thuyết về sự khác biệt giữa hai tỷ lệ. Phương pháp này:
+
+1. **Center data**: Dịch chuyển mỗi nhóm về trung bình 0 (giả định H₀ đúng)
+2. **Resample**: Lấy mẫu lại từ mỗi nhóm đã center
+3. **Tính statistic**: Tính chênh lệch mean(A) - mean(B) cho mỗi mẫu bootstrap
+4. **So sánh**: Tính p-value bằng cách so sánh với chênh lệch quan sát
+
+```{r}
+# Hàm bootstrap kiểm định chênh lệch tỷ lệ
+boot_diff_prop <- function(.data, x, g, R = 10000, 
+                           alternative = c("two.sided", "greater", "less"),
+                           seed = NULL) {
+  alternative <- match.arg(alternative)
+  
+  # --- Chuẩn bị dữ liệu ---
+  df <- .data |> drop_na({{x}}, {{g}})
+  xv <- df |> pull({{x}})
+  gv <- df |> pull({{g}})
+  g_levels <- levels(as.factor(gv))
+  stopifnot(length(g_levels) == 2)
+  
+  A <- g_levels[1]
+  B <- g_levels[2]
+  
+  nA <- sum(gv == A)
+  nB <- sum(gv == B)
+  
+  # meanA - meanB (chênh lệch quan sát)
+  t_obs <- mean(xv[gv == A]) - mean(xv[gv == B])
+  
+  # Center data về trung bình 0 (giả định H0 đúng)
+  df_center <- df |>
+    mutate(.g = as.factor({{g}}), .x = {{x}}) |>
+    group_by(.g) |>
+    mutate(.x_center = .x - mean(.x)) |>
+    ungroup()
+  
+  pool_A <- df_center$.x_center[df_center$.g == A]
+  pool_B <- df_center$.x_center[df_center$.g == B]
+  
+  # Bootstrap
+  if (!is.null(seed)) set.seed(seed)
+  t_star <- numeric(R)
+  for (i in seq_len(R)) {
+    samp_A <- sample(pool_A, size = nA, replace = TRUE)
+    samp_B <- sample(pool_B, size = nB, replace = TRUE)
+    t_star[i] <- mean(samp_A) - mean(samp_B)
+  }
+  
+  # --- p-value ---
+  pval <- switch(alternative,
+                 "two.sided" = mean(abs(t_star) >= abs(t_obs)),
+                 "greater"   = mean(t_star >= t_obs),
+                 "less"      = mean(t_star <= t_obs))
+  
+  # --- Trả về kết quả ---
+  list(summary = tibble(
+       t_obs = t_obs,
+       p_value = pval,
+       alternative = alternative,
+       n_A = nA,
+       n_B = nB,
+       rate_A = mean(xv[gv == A]),
+       rate_B = mean(xv[gv == B]),
+       A = A,
+       B = B
+     ),
+     t_star = t_star)
+}
+```
+
+## 2.2 Thực hiện Bootstrap Test
+
+```{r bootstrap-run}
+# Chạy bootstrap với 10000 lần lặp
+# Kiểm định một phía: H1: ad > psa (quảng cáo tốt hơn)
+boot_out <- boot_diff_prop(data, x = converted, g = test_group,
+                           R = 10000, alternative = "greater", seed = 2024)
+
+# Hiển thị kết quả tóm tắt
+print(boot_out$summary)
+
+# Lưu các biến để dùng sau
+bootstrap_diffs <- boot_out$t_star
+obs_diff_boot <- boot_out$summary$t_obs
+p_value_boot <- boot_out$summary$p_value
+```
+
+
+## 2.3 Biểu đồ phân phối Bootstrap
+
+```{r plot-bootstrap, fig.cap="Phân phối Bootstrap của chênh lệch tỷ lệ chuyển đổi", fig.width=10, fig.height=6}
+# Tạo dataframe cho ggplot
+bootstrap_df <- data.frame(diff = bootstrap_diffs)
+
+# Vẽ histogram
+ggplot(bootstrap_df, aes(x = diff)) +
+  geom_histogram(bins = 50, fill = "#00CDCD", alpha = 0.7, color = "white") +
+  geom_vline(xintercept = obs_diff_boot, color = "blue4", 
+             linetype = "solid", linewidth = 1.2) +
+  geom_vline(xintercept = 0, color = "black", 
+             linetype = "dotted", linewidth = 0.8) +
+  labs(
+    title = "Phân phối Bootstrap của chênh lệch Conversion Rate",
+    subtitle = sprintf("10000 lần lặp | H1: ad > psa | p-value = %.4f", p_value_boot),
+    x = "Chênh lệch (ad - psa)",
+    y = "Tần số"
+  ) +
+  theme_minimal(base_size = 15) +
+  theme(plot.title = element_text(hjust=0.5,color="#2E8B57", face = "bold", size = 16),
+        plot.subtitle=element_text(hjust=0.5,color="#2E8B57", face = "bold", size = 16),
+        axis.title.x = element_text(color = "#008B8B"),
+        axis.title.y = element_text(color = "#008B8B"))
+
+
+```
+
+
+
+**Giải thích biểu đồ:**
+
+- **Histogram xanh**: Phân phối bootstrap của chênh lệch dưới H₀ (dữ liệu đã center)
+- **Đường xanh đậm liền liền**: Chênh lệch quan sát thực tế
+- **Đường đen chấm**: Giá trị 0 (không có hiệu ứng)
+- **p-value**: Xác suất quan sát được chênh lệch ≥ obs_diff nếu H₀ đúng
+
+## 2.4 Kết luận Bootstrap
+
+```{r bootstrap-conclusion, results='hold'}
+alpha <- 0.05
+
+cat("\nKẾT LUẬN BOOTSTRAP TEST:\n")
+cat(sprintf("Chênh lệch quan sát: %.4f (%.2f%%)\n", obs_diff_boot, obs_diff_boot * 100))
+cat(sprintf("p-value (H₁: ad > psa): %.4f\n", p_value_boot))
+cat(sprintf("Mức ý nghĩa α: %.2f\n\n", alpha))
+
+if (p_value_boot < alpha) {
+  cat("p-value < α → BÁC BỎ giả thuyết H₀\n")
+  cat("   → CÓ bằng chứng thống kê mạnh rằng quảng cáo (ad) tăng tỷ lệ chuyển đổi\n")
+  cat("   → Nhóm ad có conversion rate cao hơn nhóm psa một cách có ý nghĩa\n")
+} else {
+  cat("p-value ≥ α → KHÔNG BÁC BỎ giả thuyết H₀\n")
+  cat("   → Không có bằng chứng đủ mạnh về hiệu ứng của quảng cáo\n")
+  cat("   → Chênh lệch có thể do ngẫu nhiên\n")
+}
+```
+
+
+---
+
+# 3. Permutation Test
+
+## 3.1 Phương pháp Permutation
+
+Phương pháp: Hoán vị ngẫu nhiên nhãn nhóm, tính lại chênh lệch, so sánh với chênh lệch thực tế.
+
+```{r permutation-function}
+# HÀM PERMUTATION TEST
+perm_diff_prop <- function(.data, x, g, R = 10000, 
+                           alternative = c("two.sided","greater","less")){
+  alternative <- match.arg(alternative)
+  
+  # Chuẩn bị dữ liệu
+  df <- .data |> drop_na({{x}}, {{g}})
+  xv <- df |> pull({{x}})
+  gv <- df |> pull({{g}})
+  g_levels <- levels(as.factor(gv))
+  stopifnot(length(g_levels) == 2)
+  
+  # Chênh lệch quan sát (A - B theo thứ tự levels)
+  A <- g_levels[1]
+  B <- g_levels[2]
+  obs <- mean(xv[gv == A]) - mean(xv[gv == B])
+  
+  # Hoán vị R lần
+  n <- length(xv)
+  nA <- sum(gv == A)
+  nB <- sum(gv == B)
+  perm_stats <- numeric(R)
+  for(i in seq_len(R)){
+    idx_a <- sample(x = 1:n, size = nA, replace = FALSE)
+    idx_b <- setdiff(x = 1:n, y = idx_a)
+    perm_stats[i] <- mean(xv[idx_a]) - mean(xv[idx_b])
+  }
+  
+  # p-value theo đối thuyết
+  pval <- switch(alternative,
+                 "two.sided" = mean(abs(perm_stats) >= abs(obs)),
+                 "greater"   = mean(perm_stats >= obs),
+                 "less"      = mean(perm_stats <= obs))
+  
+  # Trả về kết quả
+  list(
+    summary = tibble(
+      stat_obs = obs,
+      p_value  = pval,
+      alternative = alternative,
+      n_A = nA,
+      n_B = nB,
+      rate_A = mean(xv[gv == A]),
+      rate_B = mean(xv[gv == B]),
+      A = A,
+      B = B
+    ),
+    perm_stats = perm_stats
+  )
+}
+```
+
+## 3.2 Thực hiện Permutation Test
+
+Permutation test (kiểm định hoán vị) kiểm tra giả thuyết:
+
+- **H₀**: Không có sự khác biệt giữa hai nhóm (test_group không ảnh hưởng đến conversion)
+- **H₁**: Nhóm ad có conversion rate **cao hơn** nhóm psa (ad > psa)
+
+```{r, results='hold'}
+# Chạy permutation test với 10000 lần hoán vị
+# Kiểm định một phía: H1: ad > psa
+perm_out <- perm_diff_prop(data, x = converted, g = test_group,
+                           R = 10000, alternative = "greater")
+
+# Hiển thị kết quả tóm tắt
+cat("KẾT QUẢ PERMUTATION TEST\n")
+cat(strrep("=", 50), "\n")
+print(perm_out$summary)
+
+# Lưu các biến để dùng sau
+perm_diffs <- perm_out$perm_stats
+obs_diff <- perm_out$summary$stat_obs
+p_value <- perm_out$summary$p_value
+```
+
+## 3.3 Biểu đồ Permutation Distribution
+
+```{r plot-permutation, fig.cap="Phân phối hoán vị vs chênh lệch quan sát", fig.width=10, fig.height=6}
+# Tạo dataframe
+perm_df <- data.frame(diff = perm_diffs)
+
+# Vẽ histogram
+ggplot(perm_df, aes(x = diff)) +
+  geom_histogram(bins = 50, fill = "#00CDCD", alpha = 0.7, color = "white") +
+  geom_vline(xintercept = obs_diff_boot, color = "blue4", 
+             linetype = "solid", linewidth = 1.2) +
+  geom_vline(xintercept = 0, color = "black", 
+             linetype = "dotted", linewidth = 0.8) +
+  labs(
+    title = "Phân phối Permutation của chênh lệch Conversion Rate",
+    subtitle = sprintf("10000 lần hoán vị | H1: ad > psa | p-value = %.4f", p_value),
+    x = "Chênh lệch (ad - psa)",
+    y = "Tần số"
+  ) +
+  theme_minimal(base_size = 15) +
+  theme(plot.title = element_text(hjust=0.5,color="#2E8B57", face = "bold", size = 16),
+        plot.subtitle=element_text(hjust=0.5,color="#2E8B57", face = "bold", size = 16),
+        axis.title.x = element_text(color = "#008B8B"),
+        axis.title.y = element_text(color = "#008B8B"))
+
+```
+
+
+
+**Giải thích biểu đồ:**
+
+- **Histogram xanh**: Phân phối chênh lệch khi H₀ đúng (không có hiệu ứng)
+- **Đường xanh đậm**: Chênh lệch quan sát thực tế
+- **Đường đen chấm**: Giá trị 0 (không có sự khác biệt)
+- **p-value**: Tỷ lệ các hoán vị có chênh lệch ≥ chênh lệch quan sát (one-tailed test)
+
+## 3.4 Kết luận Permutation Test
+
+```{r, results='hold'}
+alpha <- 0.05
+
+cat("\nKẾT LUẬN PERMUTATION TEST:\n")
+cat(sprintf("Chênh lệch quan sát: %.4f (%.2f%%)\n", obs_diff, obs_diff * 100))
+cat(sprintf("p-value (H₁: ad > psa): %.4f\n", p_value))
+cat(sprintf("Mức ý nghĩa α: %.2f\n\n", alpha))
+
+if (p_value < alpha) {
+  cat("p-value < α → BÁC BỎ giả thuyết H₀\n")
+  cat("   → CÓ bằng chứng thống kê về sự khác biệt giữa hai nhóm\n")
+  if (obs_diff > 0) {
+    cat("   → Quảng cáo CÓ HIỆU QUẢ trong việc tăng conversion rate\n")
+    cat("   → Nhóm ad có tỷ lệ chuyển đổi cao hơn nhóm psa một cách có ý nghĩa\n")
+  } else {
+    cat("   → Quảng cáo có hiệu ứng TIÊU CỰC lên conversion rate\n")
+  }
+} else {
+  cat("p-value ≥ α → KHÔNG BÁC BỎ giả thuyết H₀\n")
+  cat("   → Không có bằng chứng thống kê đủ mạnh\n")
+  cat("   → Chênh lệch quan sát có thể do ngẫu nhiên\n")
+}
+```
+
+---
+
+# 4. Discussion & Tổng kết
+
+## 4.1 So sánh hai phương pháp
+
+```{r comparison-table}
+# Tạo bảng so sánh
+comparison <- data.frame(
+  Phương_pháp = c("Bootstrap (Centered)", "Permutation"),
+  Mục_đích = c("Kiểm định giả thuyết (centered bootstrap)", "Kiểm định giả thuyết (hoán vị)"),
+  Giả_định = c("H₀: không có sự khác biệt (center data)", "H₀: không có sự khác biệt"),
+  Alternative = c("H₁: ad > psa (greater)", "H₁: ad > psa (greater)"),
+  Kết_quả = c(
+    sprintf("p = %.4f", p_value_boot),
+    sprintf("p = %.4f", p_value)
+  ),
+  Kết_luận = c(
+    ifelse(p_value_boot < alpha, "Bác bỏ H₀", "Không bác bỏ H₀"),
+    ifelse(p_value < alpha, "Bác bỏ H₀", "Không bác bỏ H₀")
+  )
+)
+
+knitr::kable(comparison, align = "l", 
+             caption = "Bảng so sánh Bootstrap (Centered) và Permutation Test")
+```
+
+## 4.2 Nhận xét chi tiết
+
+### Bootstrap Test (Centered Bootstrap)
+
+**Phương pháp:**
+
+- Center dữ liệu mỗi nhóm về trung bình 0 (giả định H₀ đúng)
+- Resample từ dữ liệu đã center
+- Tính p-value bằng cách so sánh phân phối bootstrap với chênh lệch quan sát
+
+**Ưu điểm:**
+
+- Kiểm định chính xác cho giả thuyết H₀
+- Không yêu cầu giả định phân phối
+- Phân phối bootstrap xoay quanh 0 (dưới H₀)
+
+**Kết quả:**
+
+- p-value (H₁: ad > psa): `r round(p_value_boot, 4)`
+- `r ifelse(p_value_boot < alpha, "Bác bỏ H₀ → Quảng cáo CÓ hiệu quả", "Không bác bỏ H₀ → Không đủ bằng chứng")`
+
+### Permutation Test
+
+**Ưu điểm:**
+
+- Kiểm định chính xác (exact test) không cần giả định
+- Đánh giá trực tiếp xác suất quan sát được kết quả dưới H₀
+- Phù hợp với mẫu nhỏ
+
+**Kết quả:**
+
+- p-value: `r round(p_value, 4)`
+- `r ifelse(p_value < alpha, "< 0.05 → Bác bỏ H₀, có hiệu ứng đáng kể", "≥ 0.05 → Không bác bỏ H₀")`
+
+## 4.3 Kết luận tổng thể
+
+```{r, results='hold'}
+cat("\n" %+% strrep("=", 60) %+% "\n")
+cat(" KẾT LUẬN CUỐI CÙNG\n")
+cat(strrep("=", 60) %+% "\n\n")
+
+cat(sprintf("Chênh lệch conversion rate quan sát: %.2f%%\n", obs_diff_boot * 100))
+cat(sprintf("  (ad: %.2f%% vs psa: %.2f%%)\n\n", 
+            conversion_summary$conversion_pct[conversion_summary$test_group == "ad"],
+            conversion_summary$conversion_pct[conversion_summary$test_group == "psa"]))
+
+# Đánh giá ý nghĩa thống kê
+bootstrap_sig <- p_value_boot < alpha
+perm_sig <- p_value < alpha
+
+cat("Ý nghĩa thống kê:\n")
+cat(sprintf("  • Bootstrap Test (p = %.4f): %s\n", 
+            p_value_boot, ifelse(bootstrap_sig, "CÓ", "KHÔNG")))
+cat(sprintf("  • Permutation Test (p = %.4f): %s\n", 
+            p_value, ifelse(perm_sig, "CÓ", "KHÔNG")))
+
+if (bootstrap_sig && perm_sig) {
+  cat("CẢ HAI phương pháp đều BÁC BỎ H₀.\n")
+  cat("   → Kết luận MẠNH: Quảng cáo CÓ TÁC ĐỘNG TÍCH CỰC đến conversion rate.\n")
+  cat("   → Nhóm xem quảng cáo (ad) có tỷ lệ chuyển đổi cao hơn có ý nghĩa thống kê.\n")
+} else if (!bootstrap_sig && !perm_sig) {
+  cat("CẢ HAI phương pháp đều KHÔNG BÁC BỎ H₀.\n")
+  cat("   → Kết luận: Không đủ bằng chứng về hiệu ứng của quảng cáo.\n")
+  cat("   → Chênh lệch quan sát có thể do ngẫu nhiên.\n")
+} else {
+  cat("Hai phương pháp cho kết quả KHÔNG NHẤT QUÁN.\n")
+  cat("   → Cần xem xét thêm kích thước mẫu hoặc phân tích sâu hơn.\n")
+}
+
+cat("\n" %+% strrep("=", 60) %+% "\n")
+```
+
+## 4.4 Khuyến nghị
+
+**Độ tin cậy:**
+
+- Bootstrap và Permutation test đều là phương pháp robust, không yêu cầu giả định phân phối
+- Cả hai đều phù hợp với dữ liệu nhị phân (converted: TRUE/FALSE)
+- Với 10,000 lần lặp, kết quả có độ ổn định cao
+- Bootstrap test sử dụng centered data để kiểm định H₀ chính xác
+
+**Ứng dụng thực tế:**
+
+1. **Bootstrap test (Centered)**: Kiểm định chính xác giả thuyết H₀ bằng cách center dữ liệu về 0
+2. **Permutation test**: Kiểm định thuần túy, không có giả định về phân phối, phù hợp mẫu nhỏ
+3. Kết hợp cả hai để có kết luận toàn diện và tin cậy hơn
+
+**Hạn chế:**
+
+- Chỉ phân tích conversion rate tổng thể, chưa xem xét:
+  - Biến confounding (total_ads, most_ads_day, most_ads_hour)
+  - Heterogeneous treatment effects (hiệu ứng khác nhau theo subgroup)
+  - Time trends hoặc seasonal effects
+
+**Bước tiếp theo:**
+
+- Phân tích hồi quy logistic để kiểm soát các biến khác
+- Segmentation analysis theo các nhóm người dùng
+- Phân tích chi phí-lợi ích (cost-benefit analysis)
+
