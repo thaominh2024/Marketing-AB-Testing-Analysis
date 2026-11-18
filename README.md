@@ -84,8 +84,8 @@ The results are interpreted in terms of:
 ```text
 Marketing-AB-Testing-Analysis/
 ├── README.md
-├── marketing_ab_testing.Rmd
-├── analysis.html
+├── Miniproject_ABTesting.Rmd
+├── Miniproject_ABTesting.html
 ├── marketing_AB.csv
 ```
 
